@@ -69,7 +69,7 @@ def check_fermentation_stall(
         db.query(SensorReading)
         .filter(SensorReading.batch_id == batch_id)
         .order_by(SensorReading.timestamp.desc())
-        .limit(5)
+        .limit(6)
         .all()
     )
 
@@ -77,26 +77,29 @@ def check_fermentation_stall(
         return (False, AlertSeverity.WARNING, 0)
 
     sgs = [r.specific_gravity for r in recent_readings]
-    if len(sgs) < 3:
-        return (False, AlertSeverity.WARNING, 0)
 
-    stall_count = 0
+    max_consecutive = 0
+    current_consecutive = 0
     for i in range(len(sgs) - 1):
-        change = sgs[i] - sgs[i + 1]
+        change = abs(sgs[i] - sgs[i + 1])
         if change < 0.001:
-            stall_count += 1
+            current_consecutive += 1
+            if current_consecutive > max_consecutive:
+                max_consecutive = current_consecutive
+        else:
+            current_consecutive = 0
 
-    if stall_count >= 2:
+    if max_consecutive >= 2:
         is_stall = True
     else:
         is_stall = False
 
-    if stall_count >= 5:
+    if max_consecutive >= 5:
         severity = AlertSeverity.CRITICAL
     else:
         severity = AlertSeverity.WARNING
 
-    return (is_stall, severity, stall_count)
+    return (is_stall, severity, max_consecutive)
 
 
 def create_temperature_alert(
@@ -147,11 +150,11 @@ def create_stall_alert(
         severity=severity,
         batch_id=batch.id,
         reading_id=reading.id,
-        trigger_value=f"比重连续{stall_count}次下降小于0.001, 当前SG={reading.specific_gravity}",
+        trigger_value=f"比重连续{stall_count}次变化小于0.001, 当前SG={reading.specific_gravity}",
         stage_info="发酵停滞检测",
         status=AlertStatus.OPEN,
         triggered_at=reading.timestamp,
-        description=f"检测到发酵停滞: 最近{stall_count}次读数比重变化<0.001, 当前SG={reading.specific_gravity}"
+        description=f"检测到发酵停滞: 最近{stall_count}次连续读数比重变化<0.001, 当前SG={reading.specific_gravity}"
     )
     db.add(alert)
     db.flush()

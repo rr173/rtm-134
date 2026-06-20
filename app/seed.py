@@ -81,27 +81,62 @@ def create_recipes(db: Session):
     return recipes
 
 
-def _generate_readings_for_batch(
-    db: Session, batch: Batch,
-    start_offset_days: int,
+def _build_sg_values(
+    og: float,
+    fg: float,
     reading_count: int,
+    stall_start: int = None,
+    stall_length: int = 0,
+):
+    total_drop = og - fg
+    normal_reading_count = reading_count
+    if stall_start is not None:
+        normal_reading_count = reading_count - stall_length
+
+    sg_drop_normal = total_drop / normal_reading_count if normal_reading_count > 0 else 0
+
+    values = []
+    for i in range(reading_count):
+        if stall_start is not None and i >= stall_start and i < stall_start + stall_length:
+            sg = values[-1] if values else og
+        else:
+            idx = i
+            if stall_start is not None and i >= stall_start + stall_length:
+                idx = i - stall_length
+            sg = og - sg_drop_normal * (idx + 1)
+        values.append(round(sg, 4))
+
+    return values
+
+
+def _generate_readings_for_batch(
+    db: Session,
+    batch: Batch,
+    interval_hours: int,
+    sg_values: list,
     inject_anomaly_at_indices=None,
+    inject_stall_indices=None,
 ):
     if inject_anomaly_at_indices is None:
         inject_anomaly_at_indices = []
+    if inject_stall_indices is None:
+        inject_stall_indices = []
 
     recipe = batch.recipe
-    start_time = batch.start_date + timedelta(days=start_offset_days)
+    start_time = batch.start_date
+    reading_count = len(sg_values)
+
+    random.seed(batch.id * 1000 + reading_count)
 
     readings = []
-    base_sg = batch.measured_og
-    sg_drop_per_reading = (base_sg - recipe.target_fg) / (reading_count + 5)
-
-    random.seed(batch.id * 1000 + start_offset_days)
-
     for i in range(reading_count):
-        ts = start_time + timedelta(hours=i * 3)
+        ts = start_time + timedelta(hours=i * interval_hours)
+
+        if ts > datetime.now() + timedelta(hours=1):
+            break
+
         stage_result = get_current_stage(batch, ts)
+        sg = sg_values[i]
 
         if stage_result:
             stage, _, _ = stage_result
@@ -111,18 +146,20 @@ def _generate_readings_for_batch(
             if i in inject_anomaly_at_indices:
                 temp = target_temp + tolerance * 1.8 + random.uniform(0.5, 1.5)
             else:
-                temp = target_temp + random.uniform(-tolerance * 0.7, tolerance * 0.7)
+                temp = target_temp + random.uniform(-tolerance * 0.5, tolerance * 0.5)
         else:
             temp = 20.0
 
-        sg = round(base_sg - sg_drop_per_reading * (i + 1) + random.uniform(-0.0005, 0.0005), 4)
+        is_abnormal = 0
+        if i in inject_anomaly_at_indices or i in inject_stall_indices:
+            is_abnormal = 1
 
         reading = SensorReading(
             batch_id=batch.id,
             timestamp=ts,
             temperature=round(temp, 2),
             specific_gravity=sg,
-            is_abnormal=0,
+            is_abnormal=is_abnormal,
         )
         if stage_result:
             stage, _, _ = stage_result
@@ -132,17 +169,13 @@ def _generate_readings_for_batch(
     db.flush()
 
     for reading in readings:
-        idx = readings.index(reading)
         stage_result = get_current_stage(batch, reading.timestamp)
-        is_abnormal = 0
-
         if stage_result:
             stage, _, _ = stage_result
             is_temp_violation, severity, deviation = check_temperature_deviation(
                 reading.temperature, stage
             )
             if is_temp_violation:
-                is_abnormal = 1
                 existing = (
                     db.query(Alert)
                     .filter(
@@ -155,19 +188,16 @@ def _generate_readings_for_batch(
                 if not existing:
                     create_temperature_alert(db, batch, reading, stage, deviation, severity)
 
-        reading.is_abnormal = is_abnormal
-
     db.flush()
 
-    for i, reading in enumerate(readings):
-        is_stall, stall_severity, stall_count = check_fermentation_stall(
-            db, batch.id, reading
-        )
-        if is_stall:
-            reading.is_abnormal = 1
-            create_stall_alert(db, batch, reading, stall_count, stall_severity)
-            db.flush()
+    for idx in inject_stall_indices:
+        if idx < len(readings):
+            reading = readings[idx]
+            stall_count = len([x for x in inject_stall_indices if x <= idx])
+            severity = AlertSeverity.CRITICAL if stall_count >= 5 else AlertSeverity.WARNING
+            create_stall_alert(db, batch, reading, stall_count, severity)
 
+    db.flush()
     return readings
 
 
@@ -193,11 +223,15 @@ def create_active_batches(db: Session, recipes):
     db.add(batch1)
     db.flush()
 
+    elapsed_hours_1 = int((now - batch1_start).total_seconds() / 3600)
+    reading_count_1 = elapsed_hours_1 // 8
+    sg_values_1 = _build_sg_values(1.0648, 1.012, reading_count_1)
+
     _generate_readings_for_batch(
         db, batch1,
-        start_offset_days=0,
-        reading_count=20,
-        inject_anomaly_at_indices=[5, 13],
+        interval_hours=8,
+        sg_values=sg_values_1,
+        inject_anomaly_at_indices=[5, min(13, reading_count_1 - 2)],
     )
 
     batch2_start = now - timedelta(days=4, hours=12)
@@ -216,11 +250,15 @@ def create_active_batches(db: Session, recipes):
     db.add(batch2)
     db.flush()
 
+    elapsed_hours_2 = int((now - batch2_start).total_seconds() / 3600)
+    reading_count_2 = elapsed_hours_2 // 8
+    sg_values_2 = _build_sg_values(1.0547, 1.015, reading_count_2)
+
     _generate_readings_for_batch(
         db, batch2,
-        start_offset_days=0,
-        reading_count=20,
-        inject_anomaly_at_indices=[7, 16],
+        interval_hours=8,
+        sg_values=sg_values_2,
+        inject_anomaly_at_indices=[7, min(16, reading_count_2 - 2)],
     )
 
     db.flush()
@@ -254,11 +292,19 @@ def create_completed_batch(db: Session, recipes):
     db.add(batch)
     db.flush()
 
-    readings = _generate_readings_for_batch(
+    sg_values = _build_sg_values(
+        measured_og, measured_fg,
+        reading_count=25,
+        stall_start=20,
+        stall_length=3,
+    )
+
+    _generate_readings_for_batch(
         db, batch,
-        start_offset_days=0,
-        reading_count=60,
-        inject_anomaly_at_indices=[25, 42],
+        interval_hours=10,
+        sg_values=sg_values,
+        inject_anomaly_at_indices=[8, 17],
+        inject_stall_indices=[21, 22, 23],
     )
 
     report = generate_quality_report(db, batch)
